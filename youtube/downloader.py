@@ -1,12 +1,12 @@
-#!/usr/bin/env python
-
 from __future__ import print_function
 
 import io
 import json
+import os
 import sys
 import time
 
+import argparse
 import lxml.html
 import requests
 from lxml.cssselect import CSSSelector
@@ -29,20 +29,20 @@ def ajax_request(session, url, params=None, data=None, headers=None, retries=5, 
         response = session.post(url, params=params, data=data, headers=headers)
         if response.status_code == 200:
             return response.json()
-        if response.status_code == 413:
+        if response.status_code in [403, 413]:
             return {}
         else:
             time.sleep(sleep)
 
 
 def download_comments(youtube_id, sleep=.1):
-    if 'liveStreamability' in requests.get(YOUTUBE_VIDEO_URL.format(youtube_id=youtube_id)).text:
+    if r'"isLiveContent":true' in requests.get(YOUTUBE_VIDEO_URL.format(youtube_id=youtube_id)).text:
         print('Live stream detected! Not all comments may be downloaded.')
         return download_comments_new_api(youtube_id, sleep)
     return download_comments_old_api(youtube_id, sleep)
 
 
-def download_comments_new_api(youtube_id, sleep=.1):
+def download_comments_new_api(youtube_id, sleep=1):
     # Use the new youtube API to download some comments
     session = requests.Session()
     session.headers['User-Agent'] = USER_AGENT
@@ -50,9 +50,13 @@ def download_comments_new_api(youtube_id, sleep=.1):
     response = session.get(YOUTUBE_VIDEO_URL.format(youtube_id=youtube_id))
     html = response.text
     session_token = find_value(html, 'XSRF_TOKEN', 3)
+    session_token = session_token.encode('ascii').decode('unicode-escape')
 
-    data = json.loads(find_value(html, 'window["ytInitialData"] = ', 0, '\n').rstrip(';'))
-    ncd = next(search_dict(data, 'nextContinuationData'))
+    data = json.loads(find_value(html, 'var ytInitialData = ', 0, '};') + '}')
+    for renderer in search_dict(data, 'itemSectionRenderer'):
+        ncd = next(search_dict(renderer, 'nextContinuationData'), None)
+        if ncd:
+            break
     continuations = [(ncd['continuation'], ncd['clickTrackingParams'])]
 
     while continuations:
@@ -65,12 +69,13 @@ def download_comments_new_api(youtube_id, sleep=.1):
                                         'itct': itct},
                                 data={'session_token': session_token},
                                 headers={'X-YouTube-Client-Name': '1',
-                                         'X-YouTube-Client-Version': '2.20200207.03.01'})
+                                         'X-YouTube-Client-Version': '2.20201202.06.01'})
 
         if not response:
             break
         if list(search_dict(response, 'externalErrorMessage')):
-            raise RuntimeError('Error returned from server: ' + next(search_dict(response, 'externalErrorMessage')))
+            raise RuntimeError('Error returned from server: ' +
+                               next(search_dict(response, 'externalErrorMessage')))
 
         # Ordering matters. The newest continuations should go first.
         continuations = [(ncd['continuation'], ncd['clickTrackingParams'])
@@ -78,11 +83,13 @@ def download_comments_new_api(youtube_id, sleep=.1):
 
         for comment in search_dict(response, 'commentRenderer'):
             yield {'cid': comment['commentId'],
-                   'text': comment['contentText']['runs'][0]['text'],
+                   'text': ''.join([c['text'] for c in comment['contentText']['runs']]),
                    'time': comment['publishedTimeText']['runs'][0]['text'],
                    'author': comment.get('authorText', {}).get('simpleText', ''),
+                   'channel': comment['authorEndpoint']['browseEndpoint']['browseId'],
                    'votes': comment.get('voteCount', {}).get('simpleText', '0'),
-                   'photo': comment['authorThumbnail']['thumbnails'][-1]['url']}
+                   'photo': comment['authorThumbnail']['thumbnails'][-1]['url'],
+                   'heart': next(search_dict(comment, 'isHearted'), False)}
 
         time.sleep(sleep)
 
@@ -93,10 +100,12 @@ def search_dict(partial, key):
             if k == key:
                 yield v
             else:
-                yield from search_dict(v, key)
+                for o in search_dict(v, key):
+                    yield o
     elif isinstance(partial, list):
         for i in partial:
-            yield from search_dict(i, key)
+            for o in search_dict(i, key):
+                yield o
 
 
 def download_comments_old_api(youtube_id, sleep=1):
@@ -117,6 +126,7 @@ def download_comments_old_api(youtube_id, sleep=1):
 
     page_token = find_value(html, 'data-token')
     session_token = find_value(html, 'XSRF_TOKEN', 3)
+    session_token = session_token.encode('ascii').decode('unicode-escape')
 
     first_iteration = True
 
@@ -134,11 +144,13 @@ def download_comments_old_api(youtube_id, sleep=1):
         else:
             data['page_token'] = page_token
 
-        response = ajax_request(session, YOUTUBE_COMMENTS_AJAX_URL_OLD, params, data)
+        response = ajax_request(
+            session, YOUTUBE_COMMENTS_AJAX_URL_OLD, params, data)
         if not response:
             break
 
-        page_token, html = response.get('page_token', None), response['html_content']
+        page_token, html = response.get(
+            'page_token', None), response['html_content']
 
         reply_cids += extract_reply_cids(html)
         for comment in extract_comments(html):
@@ -161,7 +173,8 @@ def download_comments_old_api(youtube_id, sleep=1):
                   'filter': youtube_id,
                   'tab': 'inbox'}
 
-        response = ajax_request(session, YOUTUBE_COMMENTS_AJAX_URL_OLD, params, data)
+        response = ajax_request(
+            session, YOUTUBE_COMMENTS_AJAX_URL_OLD, params, data)
         if not response:
             break
 
@@ -180,16 +193,19 @@ def extract_comments(html):
     text_sel = CSSSelector('.comment-text-content')
     time_sel = CSSSelector('.time')
     author_sel = CSSSelector('.user-name')
-    vote_sel = CSSSelector('.like-count')
+    vote_sel = CSSSelector('.like-count.off')
     photo_sel = CSSSelector('.user-photo')
+    heart_sel = CSSSelector('.creator-heart-background-hearted')
 
     for item in item_sel(tree):
         yield {'cid': item.get('data-cid'),
                'text': text_sel(item)[0].text_content(),
                'time': time_sel(item)[0].text_content().strip(),
                'author': author_sel(item)[0].text_content(),
-               'votes': vote_sel(item)[0].text_content(),
-               'photo': photo_sel(item)[0].get('src')}
+               'channel': item[0].get('href').replace('/channel/', '').strip(),
+               'votes': vote_sel(item)[0].text_content() if len(vote_sel(item)) > 0 else 0,
+               'photo': photo_sel(item)[0].get('src'),
+               'heart': bool(heart_sel(item))}
 
 
 def extract_reply_cids(html):
